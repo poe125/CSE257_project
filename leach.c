@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <random.h>
 #include <etimer.h>
+#include <process.h>
 #include "../contiki-2.7/core/net/rime.h"
 #include "../contiki-2.7/core/net/rime/broadcast.h"
 #include "../contiki-2.7/core/net/rime/unicast.h"
@@ -11,7 +12,7 @@
 #include "../contiki-2.7/core/net/netstack.h"
 #include "../contiki-2.7/core/net/rime/collect.h"
 
-#define MAX_UNICAST_NODES 100
+#define MAX_NODES 100
 #define UNICAST_EVENT  (PROCESS_EVENT_MAX + 1)
 
 /*---------------------------------------------------------------------------*/
@@ -64,7 +65,7 @@ static struct broadcast_conn broadcast;
 
 /*---------------------------------------------------------------------------*/
 //UNICAST
-static rimeaddr_t received_nodes[MAX_UNICAST_NODES];
+static rimeaddr_t received_nodes[MAX_NODES];
 static uint8_t num_received_nodes = 0;
 
 //update the list of received nodes
@@ -77,23 +78,13 @@ static void update_received_nodes_list(const rimeaddr_t node) {
       }
     }
     // Add the node to the list
-    if (num_received_nodes < MAX_UNICAST_NODES) {
+    if (num_received_nodes < MAX_NODES) {
       rimeaddr_copy(&received_nodes[num_received_nodes], &node);
       num_received_nodes++;
     } else {
       printf("Max number of nodes reached in the list.\n");
     }
 }
-// Unicast receive callback function
-static void recv_uc(struct unicast_conn *c, const rimeaddr_t *from) {
-  const char *received_message = (char *)packetbuf_dataptr();
-  printf("Unicast message received from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message);
-  update_received_nodes_list(*from);
-}
-
-// Unicast connection callbacks
-static const struct unicast_callbacks unicast_call = {recv_uc};
-static struct unicast_conn unicast;
 
 uint8_t i;
 static void print_received_nodes_list() {
@@ -101,15 +92,27 @@ static void print_received_nodes_list() {
   for (i = 0; i < num_received_nodes; i++) {
     printf("Node %d.%d\n", received_nodes[i].u8[0], received_nodes[i].u8[1]);
   }
-
 }
+
+// Unicast receive callback function
+static void unicast_recv(struct unicast_conn *c, const rimeaddr_t *from) {
+  const char *received_message = (char *)packetbuf_dataptr();
+  printf("Unicast message received from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message);
+  update_received_nodes_list(*from);
+  print_received_nodes_list();
+}
+
+// Unicast connection callbacks
+static const struct unicast_callbacks unicast_call = {unicast_recv};
+static struct unicast_conn unicast;
+
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(unicast_process, ev, data) {
     PROCESS_EXITHANDLER(unicast_close(&unicast);)
     PROCESS_BEGIN();
 
     // Open the unicast connection
-    unicast_open(&unicast, 146, &unicast_call);
+    unicast_open(&unicast, 156, &unicast_call);
 
     while (1) {
         PROCESS_WAIT_EVENT();
@@ -145,6 +148,7 @@ static void set_up_phase(){
     }
 
     if(is_ch){//CLUSTER HEAD
+        NETSTACK_RDC.off(1);
         printf("Round %d: I am a Cluster Head!\n", r);
         packetbuf_copyfrom("Hello", strlen("Hello") + 1);  // send this message using the broadcast
         broadcast_send(&broadcast);
@@ -160,20 +164,15 @@ static void set_up_phase(){
 }
 /*---------------------------------------------------------------------------*/
 static void steady_phase(){
-    printf("Steady Phase: Strongest Neighbor: %d.%d\n", strongest_neighbor.address.u8[0], strongest_neighbor.address.u8[1]);
-    //choose the CH again
-
     if(!is_ch){ //NOT CLUSTER HEAD
         //inform themselves to CH using unicast
-        printf("Steady Phase: I am not a Cluster Head.\n");
+        printf("Steady Phase: Strongest Neighbor: %d.%d\n", strongest_neighbor.address.u8[0], strongest_neighbor.address.u8[1]);
         packetbuf_copyfrom("Return msg", strlen("Return msg") + 1);
         unicast_send(&unicast, &strongest_neighbor.address);
-        process_post(&unicast_process, UNICAST_EVENT, NULL);
     } else { //CLUSTER HEAD
         NETSTACK_RDC.off(0);
         printf("Steady Phase: I am a Cluster Head!\n");
         //create a list of members in clusters
-        print_received_nodes_list();
         //schedule communication of non-CH nodes based on TDMA
 
         //transmitter turned off for non-CHs when it's not sending
@@ -196,15 +195,21 @@ PROCESS_THREAD(leach_process, ev, data){
 
     while (1)
     {
-        etimer_set(&timer, CLOCK_SECOND * 2);
+        etimer_set(&timer, CLOCK_SECOND * 2);// 2 seconds
         PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer)); 
         // LEACH protocol logic
         // Periodically perform clustering, elect cluster heads, etc.
         set_up_phase();
+        broadcast_close(&broadcast);
+        etimer_set(&timer, CLOCK_SECOND * 5);// 2 seconds
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
         // Send and receive data within clusters
         // LEACH-specific code
         //Steady Phase logic
         steady_phase();
+        unicast_close(&unicast);
+        etimer_set(&timer, CLOCK_SECOND * 5);// 2 seconds
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
         r++;
         PROCESS_YIELD();
     }
