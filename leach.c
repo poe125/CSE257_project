@@ -96,29 +96,40 @@ static void print_received_nodes_list() {
 
 // Unicast receive callback function
 static void unicast_recv(struct unicast_conn *c, const rimeaddr_t *from) {
-  const char *received_message = (char *)packetbuf_dataptr();
-  printf("Unicast message received from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message);
+  const char *received_message_uni = (char *)packetbuf_dataptr();
+  printf("Unicast message received from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message_uni);
   update_received_nodes_list(*from);
   print_received_nodes_list();
 }
 
 // Unicast connection callbacks
-static const struct unicast_callbacks unicast_call = {unicast_recv};
-static struct unicast_conn unicast;
+static const struct unicast_callbacks unicast_callbacks = {unicast_recv};
+static struct unicast_conn uc;
 
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(unicast_process, ev, data) {
-    PROCESS_EXITHANDLER(unicast_close(&unicast);)
+    PROCESS_EXITHANDLER(unicast_close(&uc);)
     PROCESS_BEGIN();
 
     // Open the unicast connection
-    unicast_open(&unicast, 156, &unicast_call);
+    unicast_open(&uc, 146, &unicast_callbacks);
 
     while (1) {
-        PROCESS_WAIT_EVENT();
-    }
+        static struct etimer et;
+        rimeaddr_t addr;
+
+        etimer_set(&et, CLOCK_SECOND);
+
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+
+        packetbuf_copyfrom("Hello", 5);
+        addr = strongest_neighbor.address;
+        if(!rimeaddr_cmp(&addr, &rimeaddr_node_addr)) {
+          unicast_send(&uc, &addr);
+        }
 
     PROCESS_END();
+}
 }
 
 PROCESS_THREAD(broadcast_process, ev, data) {
@@ -167,8 +178,8 @@ static void steady_phase(){
     if(!is_ch){ //NOT CLUSTER HEAD
         //inform themselves to CH using unicast
         printf("Steady Phase: Strongest Neighbor: %d.%d\n", strongest_neighbor.address.u8[0], strongest_neighbor.address.u8[1]);
-        packetbuf_copyfrom("Return msg", strlen("Return msg") + 1);
-        unicast_send(&unicast, &strongest_neighbor.address);
+        packetbuf_copyfrom("Hello back", strlen("Hello back") + 1);
+        unicast_send(&uc, &strongest_neighbor.address);
     } else { //CLUSTER HEAD
         NETSTACK_RDC.off(0);
         printf("Steady Phase: I am a Cluster Head!\n");
@@ -200,16 +211,18 @@ PROCESS_THREAD(leach_process, ev, data){
         // LEACH protocol logic
         // Periodically perform clustering, elect cluster heads, etc.
         set_up_phase();
+        etimer_set(&timer, CLOCK_SECOND * 10);// 2 seconds
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
         broadcast_close(&broadcast);
-        etimer_set(&timer, CLOCK_SECOND * 5);// 2 seconds
+        etimer_set(&timer, CLOCK_SECOND);// 2 seconds
         PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
         // Send and receive data within clusters
         // LEACH-specific code
         //Steady Phase logic
         steady_phase();
-        unicast_close(&unicast);
-        etimer_set(&timer, CLOCK_SECOND * 5);// 2 seconds
+        etimer_set(&timer, CLOCK_SECOND * 10);// 2 seconds
         PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
+        unicast_close(&uc);
         r++;
         PROCESS_YIELD();
     }
