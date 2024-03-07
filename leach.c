@@ -1,232 +1,197 @@
-#include <contiki.h>
-#include <stdio.h>
+#include "contiki.h"
+#include "net/netstack.h"
+#include "net/nullnet/nullnet.h"
+#include "net/packetbuf.h"
+#include "LEACH.h"
+
 #include <string.h>
+#include <stdio.h> /* For printf() */
 #include <stdbool.h>
+#include <stdlib.h>
 #include <random.h>
 #include <etimer.h>
 #include <process.h>
-#include "../contiki-2.7/core/net/rime.h"
-#include "../contiki-2.7/core/net/rime/broadcast.h"
-#include "../contiki-2.7/core/net/rime/unicast.h"
-#include "../contiki-2.7/core/net/mac/rdc.h"
-#include "../contiki-2.7/core/net/netstack.h"
-#include "../contiki-2.7/core/net/rime/collect.h"
 
-#define MAX_NODES 100
-#define UNICAST_EVENT  (PROCESS_EVENT_MAX + 1)
+/* Log configuration */
+#include "sys/log.h"
+#define LOG_MODULE "LEACH_Node"
+#define LOG_LEVEL LOG_LEVEL_INFO
+
+/* Configuration */
+#define ADV_INTERVAL (600 * CLOCK_SECOND)
+#define ROUND_INTERVAL (6000 * CLOCK_SECOND)
+#define DATA_INTERVAL (300 * CLOCK_SECOND)
+#define P 0.05
+
+typedef struct {
+    uint8_t node_id;
+    uint8_t cluster_head;
+    uint8_t data_value;
+    int rssi;
+    int energy_usage;
+} leach_packet_t;
+
+// Define the broadcast message payload structure
+typedef struct {
+    char data[12];
+} broadcast_message_t;
+
+static leach_packet_t leach_packet;
+static volatile bool listen_enabled = true;
 
 /*---------------------------------------------------------------------------*/
-PROCESS(leach_process, "start leach process");
-PROCESS(broadcast_process, "broadcast process");
-PROCESS(unicast_process, "unicast process");
-AUTOSTART_PROCESSES(&leach_process, &broadcast_process, &unicast_process);
-/*---------------------------------------------------------------------------*/
-static int r = 0; //round
-static float p = 0.1; //probability of being CHs
-static bool is_ch = false;
-
-struct NeighborInfo {
-    rimeaddr_t address;
-    int16_t rssi;
-};
-
-struct NeighborInfo strongest_neighbor;
-static bool new_broadcast_received = false;
-rimeaddr_t strongest_cluster_head;
+PROCESS(leach_node_process, "LEACH Node Process");
+AUTOSTART_PROCESSES(&leach_node_process, &sink_process);
 
 /*---------------------------------------------------------------------------*/
-//BROADCAST//
-// Define the broadcast receive callback function
-static void broadcast_recv(struct broadcast_conn *c, const rimeaddr_t *from) {
-    const char *received_message = (char *)packetbuf_dataptr();
-    printf("Received broadcast message from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message);    
-    
-    // Get the RSSI value from the collect_neighbor structure
-    int16_t rssi_value = packetbuf_attr(PACKETBUF_ATTR_RSSI);
-    // Update information about the node with the strongest signal
-    if(new_broadcast_received == false){
-        strongest_neighbor.address = *from;
-        strongest_neighbor.rssi = rssi_value;
-    } else {
-        if (rssi_value > strongest_neighbor.rssi) {
-            strongest_neighbor.address = *from;
-            strongest_neighbor.rssi = rssi_value;
+
+void input_callback(const void *data, uint16_t len, const linkaddr_t *src, const linkaddr_t *dest){
+    LOG_INFO("Inside input_callback\n");
+    if (listen_enabled) {
+        LOG_INFO("Listen is enabled\n");
+        if (linkaddr_cmp(dest, &linkaddr_null)) {
+            // Broadcast message
+            broadcast_message_t *broadcast_msg = (broadcast_message_t *)data;
+            if (strncmp(broadcast_msg->data, "hello", sizeof(broadcast_msg->data)) == 0) {
+                // Use packetbuf_attr to get RSSI information
+                leach_packet.rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+                LOG_INFO("Received a broadcast message with payload 'hello' from %02x:%02x (RSSI: %d)\n",
+                         src->u8[0], src->u8[1], leach_packet.rssi);
+            }
+        } else {
+            // Unicast message
+            LOG_INFO("Received a unicast message from %02x:%02x to %02x:%02x\n",
+                      src->u8[0], src->u8[1], dest->u8[0], dest->u8[1]);
         }
     }
-    //store information about the strongest cluster head
-    rimeaddr_copy(&strongest_cluster_head, from);
-    printf("Strongest Signal: Node %d.%d (RSSI: %d)\n", strongest_neighbor.address.u8[0], strongest_neighbor.address.u8[1], strongest_neighbor.rssi);
-    new_broadcast_received = true;
+}
+bool should_be_cluster_head(int r){
+    double probability = P / (1 - P * (r % (int)(1 / P)));
+    // Generate a random number between 0 and 1
+    double random_value = (double)rand() / RAND_MAX;
+    LOG_INFO("random value: %f %f\n", probability, random_value);
+    return random_value < probability;
 }
 
-// Configure the broadcast connection
-static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
-static struct broadcast_conn broadcast;
 
 /*---------------------------------------------------------------------------*/
-//UNICAST
-static rimeaddr_t received_nodes[MAX_NODES];
-static uint8_t num_received_nodes = 0;
+// ... (previous code remains unchanged)
 
-//update the list of received nodes
-static void update_received_nodes_list(const rimeaddr_t node) {
-    uint8_t i;
-    // Check if the node is already in the list
-    for (i = 0; i < num_received_nodes; i++) {
-      if (rimeaddr_cmp(&received_nodes[i], &node)) {
-        return;  // Node is already in the list
-      }
-    }
-    // Add the node to the list
-    if (num_received_nodes < MAX_NODES) {
-      rimeaddr_copy(&received_nodes[num_received_nodes], &node);
-      num_received_nodes++;
-    } else {
-      printf("Max number of nodes reached in the list.\n");
-    }
-}
+PROCESS_THREAD(leach_node_process, ev, data){
+    static struct etimer adv_timer;
+    static struct etimer round_timer;
+    static struct etimer data_timer;
 
-uint8_t i;
-static void print_received_nodes_list() {
-  printf("List of received nodes:\n");
-  for (i = 0; i < num_received_nodes; i++) {
-    printf("Node %d.%d\n", received_nodes[i].u8[0], received_nodes[i].u8[1]);
-  }
-}
+    static int r = 0;
+    static int has_been_ch = 0;
 
-// Unicast receive callback function
-static void unicast_recv(struct unicast_conn *c, const rimeaddr_t *from) {
-  const char *received_message_uni = (char *)packetbuf_dataptr();
-  printf("Unicast message received from %d.%d: '%s'\n", from->u8[0], from->u8[1], received_message_uni);
-  update_received_nodes_list(*from);
-  print_received_nodes_list();
-}
-
-// Unicast connection callbacks
-static const struct unicast_callbacks unicast_callbacks = {unicast_recv};
-static struct unicast_conn uc;
-
-/*---------------------------------------------------------------------------*/
-PROCESS_THREAD(unicast_process, ev, data) {
-    PROCESS_EXITHANDLER(unicast_close(&uc);)
     PROCESS_BEGIN();
 
-    // Open the unicast connection
-    unicast_open(&uc, 146, &unicast_callbacks);
+    LOG_INFO("process begin\n");
+    // Initialize NullNet
+    nullnet_set_input_callback(input_callback);
 
-    while (1) {
-        static struct etimer et;
-        rimeaddr_t addr;
+    while(1) {
+        // Node broadcasts an advertisement
+        leach_packet.node_id = linkaddr_node_addr.u8[1];
+        leach_packet.cluster_head = 0;  // Placeholder for cluster head information
+        leach_packet.data_value = 0;    // Placeholder for data value
+        leach_packet.energy_usage = 0; 
 
-        etimer_set(&et, CLOCK_SECOND);
+        nullnet_buf = (uint8_t *)&leach_packet;
+        nullnet_len = sizeof(leach_packet);
 
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+        NETSTACK_NETWORK.output(NULL);
+        LOG_INFO("set etimer for the round interval\n");
 
-        packetbuf_copyfrom("Hello", 5);
-        addr = strongest_neighbor.address;
-        if(!rimeaddr_cmp(&addr, &rimeaddr_node_addr)) {
-          unicast_send(&uc, &addr);
+        // Set timer for initial advertisement
+        etimer_set(&adv_timer, ADV_INTERVAL);
+
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&adv_timer));
+        LOG_INFO("inside the first while loop\n");
+
+        // Set timer for next round
+        etimer_set(&round_timer, ROUND_INTERVAL);
+
+        while (1) {
+            // Setup phase
+            PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&round_timer));
+            printf("Start of the round %d\n", r);
+
+            if (leach_packet.cluster_head == 0 && has_been_ch > 0) {
+                LOG_INFO("This node was ch before, so it is adding up has_been_ch\n");
+                has_been_ch++;
+            }
+            if (has_been_ch > 1/P) {
+                LOG_INFO("Resetting has_been_ch\n");
+                has_been_ch = 0;
+            }
+            leach_packet.cluster_head = 0;
+
+            // Node checks if it should be a cluster head for this round
+            // Implement LEACH cluster head selection logic here
+            if (r == 0 || has_been_ch == 0) {
+                LOG_INFO("checking if this node could be a cluster head\n");
+                leach_packet.cluster_head = should_be_cluster_head(r);
+            }
+            if (leach_packet.cluster_head) {
+                listen_enabled = false;
+                has_been_ch++;
+                LOG_INFO("Node %u elected as a cluster head: round %d\n", leach_packet.node_id, r);
+
+                // Send broadcast
+                broadcast_message_t message;
+                LOG_INFO("Broadcasting message\n");
+                strncpy(message.data, "hello", sizeof(message.data));
+                nullnet_buf = (uint8_t *)&message;
+                nullnet_len = sizeof(message);
+
+                LOG_INFO("Node %u sends a broadcast message %s: round %d\n", leach_packet.node_id, message.data, r);
+
+                NETSTACK_NETWORK.output(NULL);
+            } else {
+                listen_enabled = true;
+                etimer_set(&data_timer, DATA_INTERVAL);
+
+                // Steady phase
+                PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&data_timer));
+                LOG_INFO("Inside Steady Phase\n");
+
+                if (leach_packet.cluster_head == 1) {
+                    LOG_INFO("Start listening\n");
+                    listen_enabled = true;
+                }
+
+                // Node sends data to its cluster head
+                if (leach_packet.cluster_head == 0) {
+                    LOG_INFO("Stop listening because it is not a clusterhead and should send data to the cluster head\n");
+                    //listen_enabled = false;
+                    leach_packet.data_value = 42;
+                    nullnet_buf = (uint8_t *)&leach_packet;
+                    nullnet_len = sizeof(leach_packet);
+
+                    LOG_INFO("Node %u sends data to cluster head %u: %u [round %d]\n",
+                             leach_packet.node_id, leach_packet.cluster_head, leach_packet.data_value, r);
+
+                    NETSTACK_NETWORK.output(NULL);
+
+                    LOG_INFO("after broadcasting\n");
+                }
+            }
+
+            // Reset data timer for the next data transmission
+            etimer_reset(&data_timer);
+            LOG_INFO("outside of the third loop\n");
+
+            // Reset round timer for the next round
+            etimer_reset(&round_timer);
+            r++;
         }
+        LOG_INFO("outside of the second loop\n");
+    }
+    LOG_INFO("outside of the first loop\n");
 
     PROCESS_END();
 }
-}
-
-PROCESS_THREAD(broadcast_process, ev, data) {
-    PROCESS_EXITHANDLER(broadcast_close(&broadcast);)
-    PROCESS_BEGIN();
-
-    // Open the broadcast connection
-    broadcast_open(&broadcast, 129, &broadcast_call);
-
-    while (1) {
-        PROCESS_WAIT_EVENT();
-    }
-
-    PROCESS_END();
-}
-/*---------------------------------------------------------------------------*/
-static void set_up_phase(){
-    //select CH using p
-    if(r==0){
-        int rand_num = random_rand();
-        is_ch = (rand_num < p * RANDOM_RAND_MAX / 100);
-    } else if(r != 0 && !is_ch){
-        int rand_num = random_rand();
-        is_ch = (rand_num < p * RANDOM_RAND_MAX / 100);
-    } else {
-        is_ch = false;
-    }
-
-    if(is_ch){//CLUSTER HEAD
-        NETSTACK_RDC.off(1);
-        printf("Round %d: I am a Cluster Head!\n", r);
-        packetbuf_copyfrom("Hello", strlen("Hello") + 1);  // send this message using the broadcast
-        broadcast_send(&broadcast);
-        //random selection of CH if there are too many-> how?
-        } else {//NOT CLUSTER HEAD
-        printf("Round %d: I am not a Cluster Head.\n", r);
-        //keep the receiver on
-        NETSTACK_RDC.off(0);
-        //choose cluster based on the minimum energy required to transit/receive messages/data
-        //select the node that gave out the strongest message
-        rimeaddr_copy(&strongest_neighbor.address, &strongest_cluster_head);
-    }
-}
-/*---------------------------------------------------------------------------*/
-static void steady_phase(){
-    if(!is_ch){ //NOT CLUSTER HEAD
-        //inform themselves to CH using unicast
-        printf("Steady Phase: Strongest Neighbor: %d.%d\n", strongest_neighbor.address.u8[0], strongest_neighbor.address.u8[1]);
-        packetbuf_copyfrom("Hello back", strlen("Hello back") + 1);
-        unicast_send(&uc, &strongest_neighbor.address);
-    } else { //CLUSTER HEAD
-        NETSTACK_RDC.off(0);
-        printf("Steady Phase: I am a Cluster Head!\n");
-        //create a list of members in clusters
-        //schedule communication of non-CH nodes based on TDMA
-
-        //transmitter turned off for non-CHs when it's not sending
-        //NETSTACK_RDC.off(1);
-        //data aggregation after collecting data from non-CHs
-        //CH trasmit the same to Base Station
-    }
-    /*if(new_broadcast_received){
-        //reset the flag
-        new_broadcast_received = false;
-    }*/
-}
-
 
 /*---------------------------------------------------------------------------*/
-//START COMMUNICATION
-static struct etimer timer;
-PROCESS_THREAD(leach_process, ev, data){
-    PROCESS_BEGIN();
-
-    while (1)
-    {
-        etimer_set(&timer, CLOCK_SECOND * 2);// 2 seconds
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer)); 
-        // LEACH protocol logic
-        // Periodically perform clustering, elect cluster heads, etc.
-        set_up_phase();
-        etimer_set(&timer, CLOCK_SECOND * 10);// 2 seconds
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
-        broadcast_close(&broadcast);
-        etimer_set(&timer, CLOCK_SECOND);// 2 seconds
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
-        // Send and receive data within clusters
-        // LEACH-specific code
-        //Steady Phase logic
-        steady_phase();
-        etimer_set(&timer, CLOCK_SECOND * 10);// 2 seconds
-        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
-        unicast_close(&uc);
-        r++;
-        PROCESS_YIELD();
-    }
-    PROCESS_END();
-}
-/*---------------------------------------------------------------------------*/
-
