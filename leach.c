@@ -39,10 +39,10 @@ static linkaddr_t coordinator_addr;
 
 /*---------------------------------------3
 ------------------------------------*/
-static linkaddr_t TDMA_list[MAX_NODE];
 static bool is_ch = false;
 static int round = 0;
 static int round_ch = -1/P;
+static bool from_sink = true;
 
 // non cluster head
 static bool new_broadcast_received = false;
@@ -51,6 +51,8 @@ static bool receiving_tdma_slots = false;
 // cluster head
 static bool receiving_tdma_data = false;
 static uint8_t advertisement_byte;
+
+static linkaddr_t sink_addr;
 
 struct NeighborInfo{
     linkaddr_t address;
@@ -63,6 +65,7 @@ typedef struct {
 } TdmaPacket;
 
 typedef struct {
+    int round;
     int values[DATA_NUM];
 } DataPacket;
 
@@ -91,7 +94,7 @@ void input_callback(const void *data, uint16_t len,
   const linkaddr_t *src, const linkaddr_t *dest)
 {
     if(dest->u8[0] == 0 && dest->u8[1] == 0){ //broadcast
-        if(!is_ch){
+        if(!is_ch && !from_sink){
             int16_t rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
             //FIRST BROADCAST (ADVERTISEMENT)
             if(!receiving_tdma_slots){
@@ -114,13 +117,16 @@ void input_callback(const void *data, uint16_t len,
                     LOG_INFO("[%d] [%d] Received packet: address %d\n", round, i, tdma_packet.address[i].u8[0]);
                 }
             }
+        } else {
+            //receive the broadcast from the sink
+            sink_addr = *src;
+            LOG_INFO("[%d] Received packet: address %d\n", round, sink_addr.u8[0]);
         }
 
     } else { //unicast
         if(is_ch){
 
             if(!receiving_tdma_data){
-                LOG_INFO("[%d] Received advertisement from %d cluster size %d\n",round, src->u8[0], tdma_packet.cluster_size);
 
                 bool node_already_present = false;
                 for (int i = 0; i < tdma_packet.cluster_size; i++) {
@@ -132,10 +138,9 @@ void input_callback(const void *data, uint16_t len,
 
                 if (!node_already_present) {
                     tdma_packet.address[tdma_packet.cluster_size] = *src;
+                    LOG_INFO("[%d] Received advertisement from %d cluster size %d\n",round, src->u8[0], tdma_packet.cluster_size);
                     tdma_packet.cluster_size++;
                 }
-
-                LOG_INFO("[%d] Received advertisement from %d cluster size %d\n",round, src->u8[0], tdma_packet.cluster_size);
 
             } else {
                 //SECOND UNICAST (DATA)
@@ -195,6 +200,7 @@ PROCESS_THREAD(leach_process, ev, data){
     static struct etimer round_timer; //for every one round
     static struct etimer adv_leach_timer;
     static struct etimer data_leach_timer;
+    static struct etimer data_sending_timer;
     PROCESS_BEGIN();
 
     LOG_INFO("Round_ch%d and round:%d\n", round_ch, round);
@@ -206,7 +212,14 @@ PROCESS_THREAD(leach_process, ev, data){
     /* Initialize NullNet */
     nullnet_set_input_callback(input_callback);
 
+    etimer_set(&data_leach_timer, DATA_INTERVAL);
+    PROCESS_WAIT_UNTIL(etimer_expired(&data_leach_timer));
+    
+    from_sink = false;
+
     etimer_set(&round_timer, ROUND_INTERVAL);
+
+    //receive sink information
 
     while(1){
         PROCESS_WAIT_UNTIL(etimer_expired(&round_timer));
@@ -258,8 +271,8 @@ PROCESS_THREAD(leach_process, ev, data){
             process_start(&data_fuse_process, NULL);
         }
 
-        etimer_reset(&adv_leach_timer);
-        PROCESS_WAIT_UNTIL(etimer_expired(&adv_leach_timer));
+        etimer_set(&data_sending_timer, WAIT_INTERVAL);
+        PROCESS_WAIT_UNTIL(etimer_expired(&data_sending_timer));
 
         // reset timer
         etimer_reset(&round_timer);
@@ -267,16 +280,15 @@ PROCESS_THREAD(leach_process, ev, data){
         etimer_reset(&data_leach_timer);
 
         process_start(&free_process, NULL);
-        
-        // reset cluster information
-
     }
     PROCESS_END();
 }
+
 /*---------------------------------------------------------------------------*/
 // decide the cluster heads
 PROCESS_THREAD(ch_process, ev, data){
     PROCESS_BEGIN();
+
     LOG_INFO("[%d] Cluster head process\n", round);
     // check whether the node has been a cluster head within the last 1/P rounds
     // if fulfilling the condition, participate in choosing the clusterhead
@@ -393,11 +405,10 @@ PROCESS_THREAD(data_fuse_process, ev, data){
     // static struct etimer adv_timer; // for the advertisement (broadcasting) by clusterheads
     PROCESS_BEGIN();
     LOG_INFO("[%d] Sending fused data\n", round);
-    uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
-    serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
+    mean_packet.round = round;
     nullnet_buf = (uint8_t *)&mean_packet;
     nullnet_len = sizeof(mean_packet);
-    NETSTACK_NETWORK.output(NULL);
+    NETSTACK_NETWORK.output(&sink_addr);
     PROCESS_END();
 }
 
