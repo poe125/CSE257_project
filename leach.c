@@ -21,8 +21,9 @@
 #define WAIT_INTERVAL (1000 * CLOCK_SECOND)
 #define ROUND_INTERVAL (6000 * CLOCK_SECOND)
 #define DATA_INTERVAL (300 * CLOCK_SECOND)
-#define P 0.5
-#define MAX_NODE 3
+#define P 0.2
+#define MAX_NODE 6
+#define DATA_NUM 10
 #define ADDR_LENGTH sizeof(linkaddr_t)
 
 /* Configuration */
@@ -48,7 +49,6 @@ static bool new_broadcast_received = false;
 static bool receiving_tdma_slots = false;
 
 // cluster head
-static int cluster_size = 0;
 static bool receiving_tdma_data = false;
 static uint8_t advertisement_byte;
 
@@ -62,9 +62,15 @@ typedef struct {
     uint8_t cluster_size;
 } TdmaPacket;
 
+typedef struct {
+    int values[DATA_NUM];
+} DataPacket;
+
 static struct NeighborInfo strongest_neighbor;
 static TdmaPacket tdma_packet;
-uint8_t received_buffer[sizeof(TdmaPacket)];
+static DataPacket data_packet;
+static DataPacket mean_packet;
+
 /*---------------------------------------------------------------------------*/
 PROCESS(leach_process, "LEACH Process");
 PROCESS(ch_process, "Choosing cluster head");
@@ -86,11 +92,10 @@ void input_callback(const void *data, uint16_t len,
 {
     if(dest->u8[0] == 0 && dest->u8[1] == 0){ //broadcast
         if(!is_ch){
-            LOG_INFO("[%d] Received broadcast from %d\n", round, src->u8[0]);
             int16_t rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
             //FIRST BROADCAST (ADVERTISEMENT)
             if(!receiving_tdma_slots){
-                LOG_INFO("[%d] Receiving advertisement broadcast\n", round);
+                LOG_INFO("[%d] Receiving advertisement broadcast from %d\n", round, src->u8[0]);
                 if(!new_broadcast_received){
                     strongest_neighbor.address = *src;
                     strongest_neighbor.rssi = rssi;
@@ -101,29 +106,46 @@ void input_callback(const void *data, uint16_t len,
                 }
             } else if(linkaddr_cmp(src, &strongest_neighbor.address)){ 
                 //SECOND BROADCAST (TDMA SLOT)
-                LOG_INFO("[%d] Receiving TDMA broadcast\n", round);
-                TdmaPacket *received_packet = (TdmaPacket *)data;
-                uint8_t received_cluster_size = received_packet->cluster_size;
+                LOG_INFO("[%d] Receiving TDMA broadcast from %d\n", round, src->u8[0]);
+                tdma_packet = *((TdmaPacket *)data);
+                uint8_t received_cluster_size = tdma_packet.cluster_size;
                 LOG_INFO("[%d] Received packet: cluster size %d\n", round, received_cluster_size);
                 for(int i=0; i<received_cluster_size; i++){
-                    LOG_INFO("[%d] [%d] Received packet: address %d\n", round, i, received_packet->address[i].u8[0]);
+                    LOG_INFO("[%d] [%d] Received packet: address %d\n", round, i, tdma_packet.address[i].u8[0]);
                 }
             }
         }
 
     } else { //unicast
         if(is_ch){
+
             if(!receiving_tdma_data){
-                //FIRST UNICAST (ADVERTISEMENT)
-                LOG_INFO("Received advertisement\n");
-                tdma_packet.address[cluster_size] = *src;
-                tdma_packet.cluster_size++;
+                LOG_INFO("[%d] Received advertisement from %d cluster size %d\n",round, src->u8[0], tdma_packet.cluster_size);
+
+                bool node_already_present = false;
+                for (int i = 0; i < tdma_packet.cluster_size; i++) {
+                    if (linkaddr_cmp(src, &tdma_packet.address[i])) {
+                        node_already_present = true;
+                        break;
+                    }
+                }
+
+                if (!node_already_present) {
+                    tdma_packet.address[tdma_packet.cluster_size] = *src;
+                    tdma_packet.cluster_size++;
+                }
+
+                LOG_INFO("[%d] Received advertisement from %d cluster size %d\n",round, src->u8[0], tdma_packet.cluster_size);
+
             } else {
                 //SECOND UNICAST (DATA)
-                LOG_INFO("Received data\n");
-
+                LOG_INFO("[%d] Received data from %d\n",round , src->u8[0]);
+                
+                data_packet = *((DataPacket *)data);
+                for(int i=0; i<DATA_NUM; i++){
+                    mean_packet.values[i] = (data_packet.values[i] + mean_packet.values[i])/2;
+                }
             }
-            LOG_INFO("[%d] Received unicast from %d\n", round, src->u8[0]);
         }
     }
 }
@@ -148,11 +170,21 @@ void serialize_TDMA_list(linkaddr_t *TDMA_list, uint8_t *serialized_list, int nu
 
 // function to reset cluster information for the next round
 void free_array(){
-    for(int j=0; j<MAX_NODE; j++){
-        TDMA_list[j].u8[0] = 0;
-        TDMA_list[j].u8[1] = 0;
+    for(int i=0; i<DATA_NUM; i++){
+        data_packet.values[i] = 0;
+        mean_packet.values[i] = 0;
     }
-    cluster_size=0;
+    for(int j=0; j<MAX_NODE; j++){
+        tdma_packet.address[j].u8[0] = 0;
+        tdma_packet.address[j].u8[1] = 0;
+    }
+    tdma_packet.cluster_size = 0;
+}
+
+void generateRandomData(DataPacket *packet) {
+    for (int i = 0; i < DATA_NUM; i++) {
+        packet->values[i] = rand() % 1000; // Generate a random number between 0 and 999
+    }
 }
 
 /*---------------------------------------------------------------------------*/
@@ -175,8 +207,6 @@ PROCESS_THREAD(leach_process, ev, data){
     nullnet_set_input_callback(input_callback);
 
     etimer_set(&round_timer, ROUND_INTERVAL);
-    
-    tdma_packet.cluster_size = 0;
 
     while(1){
         PROCESS_WAIT_UNTIL(etimer_expired(&round_timer));
@@ -204,8 +234,7 @@ PROCESS_THREAD(leach_process, ev, data){
         if(!is_ch){
             process_start(&response_process, NULL);
             // LOG_INFO("[%d] Sent back unicast\n", round);
-        }
-        
+        }    
         etimer_set(&adv_leach_timer, ADV_INTERVAL);
         PROCESS_WAIT_UNTIL(etimer_expired(&adv_leach_timer));
 
@@ -215,7 +244,7 @@ PROCESS_THREAD(leach_process, ev, data){
             LOG_INFO("[%d] Sent out tdma schedule \n", round);
         }
 
-        etimer_reset(&adv_leach_timer);
+         etimer_reset(&adv_leach_timer);
         PROCESS_WAIT_UNTIL(etimer_expired(&adv_leach_timer));
         
         if(!is_ch){
@@ -251,6 +280,8 @@ PROCESS_THREAD(ch_process, ev, data){
     LOG_INFO("[%d] Cluster head process\n", round);
     // check whether the node has been a cluster head within the last 1/P rounds
     // if fulfilling the condition, participate in choosing the clusterhead
+    
+    tdma_packet.cluster_size = 0;
 
     if(round_ch + 1/P <= round){
         is_ch = decide_cluster_head(round);
@@ -335,14 +366,27 @@ PROCESS_THREAD(send_tdma_process, ev, data){
     PROCESS_BEGIN();
 
     LOG_INFO("[%d] Sending with TDMA process\n", round);
-    uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
-    serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
-    nullnet_buf = serialized_list;
-    nullnet_len = MAX_NODE * ADDR_LENGTH;
-    NETSTACK_NETWORK.output(&dest_addr);
+    
+    generateRandomData(&data_packet);
+
+    for(int i=0; i<tdma_packet.cluster_size; i++){
+        if(linkaddr_cmp(&tdma_packet.address[i], &linkaddr_node_addr)){
+            // Set the destination address for NullNet
+            nullnet_buf = (uint8_t *)&data_packet;
+            nullnet_len = sizeof(data_packet);
+            NETSTACK_NETWORK.output(&dest_addr);
+        } else {
+            int j=0;
+            while(j<100){
+                j++;
+                //should be sleeping
+            }
+        }
+    }
         
     PROCESS_END();
 }
+
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(data_fuse_process, ev, data){
     // define the etimers
@@ -351,11 +395,12 @@ PROCESS_THREAD(data_fuse_process, ev, data){
     LOG_INFO("[%d] Sending fused data\n", round);
     uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
     serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
-    nullnet_buf = serialized_list;
-    nullnet_len = MAX_NODE * ADDR_LENGTH;
+    nullnet_buf = (uint8_t *)&mean_packet;
+    nullnet_len = sizeof(mean_packet);
     NETSTACK_NETWORK.output(NULL);
     PROCESS_END();
 }
+
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(free_process, ev, data){
     PROCESS_BEGIN();
