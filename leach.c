@@ -39,16 +39,32 @@ static linkaddr_t coordinator_addr;
 /*---------------------------------------3
 ------------------------------------*/
 static linkaddr_t TDMA_list[MAX_NODE];
-static bool is_ch = false; 
-static int round = 0; 
+static bool is_ch = false;
+static int round = 0;
 static int round_ch = -1/P;
+
 // non cluster head
 static bool new_broadcast_received = false;
-static linkaddr_t strongest_neighbor;
+static bool receiving_tdma_slots = false;
 
 // cluster head
-static int cluster_size = -1;
+static int cluster_size = 0;
+static bool receiving_tdma_data = false;
+static uint8_t advertisement_byte;
 
+struct NeighborInfo{
+    linkaddr_t address;
+    int16_t rssi;
+};
+
+typedef struct {
+    linkaddr_t address[MAX_NODE];
+    uint8_t cluster_size;
+} TdmaPacket;
+
+static struct NeighborInfo strongest_neighbor;
+static TdmaPacket tdma_packet;
+uint8_t received_buffer[sizeof(TdmaPacket)];
 /*---------------------------------------------------------------------------*/
 PROCESS(leach_process, "LEACH Process");
 PROCESS(ch_process, "Choosing cluster head");
@@ -71,11 +87,42 @@ void input_callback(const void *data, uint16_t len,
     if(dest->u8[0] == 0 && dest->u8[1] == 0){ //broadcast
         if(!is_ch){
             LOG_INFO("[%d] Received broadcast from %d\n", round, src->u8[0]);
-            strongest_neighbor = *src;
-            new_broadcast_received = true;
+            int16_t rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+            //FIRST BROADCAST (ADVERTISEMENT)
+            if(!receiving_tdma_slots){
+                LOG_INFO("[%d] Receiving advertisement broadcast\n", round);
+                if(!new_broadcast_received){
+                    strongest_neighbor.address = *src;
+                    strongest_neighbor.rssi = rssi;
+                    new_broadcast_received = true;
+                } else if (rssi > strongest_neighbor.rssi){
+                    strongest_neighbor.address = *src;
+                    strongest_neighbor.rssi = rssi;
+                }
+            } else if(linkaddr_cmp(src, &strongest_neighbor.address)){ 
+                //SECOND BROADCAST (TDMA SLOT)
+                LOG_INFO("[%d] Receiving TDMA broadcast\n", round);
+                TdmaPacket *received_packet = (TdmaPacket *)data;
+                uint8_t received_cluster_size = received_packet->cluster_size;
+                LOG_INFO("[%d] Received packet: cluster size %d\n", round, received_cluster_size);
+                for(int i=0; i<received_cluster_size; i++){
+                    LOG_INFO("[%d] [%d] Received packet: address %d\n", round, i, received_packet->address[i].u8[0]);
+                }
+            }
         }
+
     } else { //unicast
         if(is_ch){
+            if(!receiving_tdma_data){
+                //FIRST UNICAST (ADVERTISEMENT)
+                LOG_INFO("Received advertisement\n");
+                tdma_packet.address[cluster_size] = *src;
+                tdma_packet.cluster_size++;
+            } else {
+                //SECOND UNICAST (DATA)
+                LOG_INFO("Received data\n");
+
+            }
             LOG_INFO("[%d] Received unicast from %d\n", round, src->u8[0]);
         }
     }
@@ -105,7 +152,7 @@ void free_array(){
         TDMA_list[j].u8[0] = 0;
         TDMA_list[j].u8[1] = 0;
     }
-    cluster_size=-1;
+    cluster_size=0;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -129,6 +176,8 @@ PROCESS_THREAD(leach_process, ev, data){
 
     etimer_set(&round_timer, ROUND_INTERVAL);
     
+    tdma_packet.cluster_size = 0;
+
     while(1){
         PROCESS_WAIT_UNTIL(etimer_expired(&round_timer));
 
@@ -202,7 +251,7 @@ PROCESS_THREAD(ch_process, ev, data){
     LOG_INFO("[%d] Cluster head process\n", round);
     // check whether the node has been a cluster head within the last 1/P rounds
     // if fulfilling the condition, participate in choosing the clusterhead
-    
+
     if(round_ch + 1/P <= round){
         is_ch = decide_cluster_head(round);
     }
@@ -234,10 +283,8 @@ PROCESS_THREAD(adv_process, ev, data){
     // to wait for another 1/P rounds to become a cluster head
     
     LOG_INFO("[%d] Sending out broadcast\n", round);
-    uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
-    serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
-    nullnet_buf = serialized_list;
-    nullnet_len = MAX_NODE * ADDR_LENGTH;
+    nullnet_buf = &advertisement_byte;
+    nullnet_len = sizeof(advertisement_byte);
     NETSTACK_NETWORK.output(NULL);
     PROCESS_END();
 }
@@ -247,13 +294,15 @@ PROCESS_THREAD(response_process, ev, data){
     // define the etimers
     PROCESS_BEGIN();
     LOG_INFO("[%d] Sending unicast response\n", round);
-    dest_addr = strongest_neighbor;
+    dest_addr = strongest_neighbor.address;
+    //this should be after receiving all the broadcasts from the ch nodes
+    receiving_tdma_slots = true;
 
     // if a node received the broadcast
     if(new_broadcast_received){
         // send a unicast to the CH
-        uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
-        serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
+        nullnet_buf = &advertisement_byte;
+        nullnet_len = sizeof(advertisement_byte);
         NETSTACK_NETWORK.output(&dest_addr);
         LOG_INFO("[%d] sent out unicast to %d\n", round, dest_addr.u8[0]);
     } else {
@@ -269,9 +318,12 @@ PROCESS_THREAD(tdma_make_process, ev, data){
     
     PROCESS_BEGIN();
     LOG_INFO("[%d] Sending TDMA schedule\n", round);
+
     // send TDMA schedule using broadcast
-    uint8_t serialized_list[MAX_NODE * ADDR_LENGTH];
-    serialize_TDMA_list(TDMA_list, serialized_list, MAX_NODE);
+    //should be finished receiving all the unicast advertisements
+    receiving_tdma_data = true;
+    nullnet_buf = (uint8_t *)&tdma_packet;
+    nullnet_len = sizeof(tdma_packet);
     NETSTACK_NETWORK.output(NULL); 
     PROCESS_END();
 }
@@ -316,6 +368,8 @@ PROCESS_THREAD(free_process, ev, data){
     free_array();
     round++;
     new_broadcast_received = false;
+    receiving_tdma_slots = false;
+    receiving_tdma_data = false;
     is_ch = false;
 
     PROCESS_END();
